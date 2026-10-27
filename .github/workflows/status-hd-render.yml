@@ -1,0 +1,97 @@
+name: Vyntra Status HD cloud render
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/status-hd-render.yml"
+      - "cloud-renderer/**"
+  repository_dispatch:
+    types:
+      - vyntra_render_requested
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    name: Install FFmpeg and process one queued render
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout worker
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install system FFmpeg and FFprobe
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+          sudo apt-get clean
+          hash -r
+          echo "FFmpeg path: $(command -v ffmpeg)"
+          echo "FFprobe path: $(command -v ffprobe)"
+          ffmpeg -hide_banner -version
+          ffprobe -hide_banner -version
+          ffmpeg -hide_banner -filters | grep -E ' (drawtext|xfade|acrossfade|overlay|scale) '
+
+      - name: Set up Python worker
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 --version
+          python3 -m venv /tmp/vyntra-venv
+          /tmp/vyntra-venv/bin/python -m pip install --upgrade --disable-pip-version-check pip
+          /tmp/vyntra-venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir -r cloud-renderer/requirements.txt
+          /tmp/vyntra-venv/bin/python -m py_compile cloud-renderer/worker.py
+
+      - name: Run worker tests
+        shell: bash
+        working-directory: cloud-renderer
+        run: |
+          set -Eeuo pipefail
+          /tmp/vyntra-venv/bin/python -m unittest -v test_worker.py
+
+      - name: Process one queued render
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          VYNTRA_STORAGE_BUCKET: vyntra-media
+          VYNTRA_RELEASE_REPOSITORY: fasmora-continue/here
+          VYNTRA_RELEASE_TOKEN: ${{ secrets.VYNTRA_RELEASE_TOKEN }}
+          VYNTRA_MAX_OUTPUT_BYTES: "200000000"
+          VYNTRA_MAX_CONCURRENT_JOBS: "100"
+          VYNTRA_MAX_JOBS_PER_REPOSITORY: "20"
+          VYNTRA_RELEASE_TTL_HOURS: "6"
+          VYNTRA_ONESHOT: "true"
+          VYNTRA_MAX_DURATION_SECONDS: "180"
+          VYNTRA_MAX_INPUT_BYTES: "52428800"
+          VYNTRA_ENABLE_8K: "false"
+          VYNTRA_WORKER_ID: ${{ github.repository }}:${{ github.run_id }}:${{ github.run_attempt }}
+          VYNTRA_TARGET_JOB_ID: ${{ github.event.client_payload.job_id }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "${SUPABASE_URL}" || -z "${SUPABASE_SERVICE_ROLE_KEY}" ]]; then
+            if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+              echo "::notice::Worker secrets are not configured for this push run; render processing is skipped."
+              exit 0
+            fi
+            echo "::error::Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY Actions secret."
+            exit 1
+          fi
+          if [[ "${GITHUB_EVENT_NAME}" != "push" && -z "${VYNTRA_RELEASE_TOKEN:-}" ]]; then
+            echo "::error::Missing VYNTRA_RELEASE_TOKEN with Contents read/write access to fasmora-continue/here."
+            exit 1
+          fi
+          test -x "$(command -v ffmpeg)"
+          test -x "$(command -v ffprobe)"
+          ffmpeg -hide_banner -version | head -n 1
+          /tmp/vyntra-venv/bin/python -u cloud-renderer/worker.py
